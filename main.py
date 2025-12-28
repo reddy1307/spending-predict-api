@@ -46,10 +46,20 @@ def predict(req: PredictRequest):
     # Convert to DataFrame
     # -------------------------
     df = pd.DataFrame([t.dict() for t in req.transactions])
-    df["date"] = pd.to_datetime(df["date"])
 
-    # Only expenses
-    df = df[df["amount"] > 0]
+    # Ensure columns exist
+    for col in ["date", "amount", "category"]:
+        if col not in df.columns:
+            df[col] = None
+
+    # Parse dates
+    try:
+        df["date"] = pd.to_datetime(df["date"])
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid date format: {e}")
+
+    # Only expenses (treat all as positive spending)
+    df["amount"] = df["amount"].abs()
 
     if df.empty:
         raise HTTPException(status_code=400, detail="No valid expense data")
@@ -57,11 +67,7 @@ def predict(req: PredictRequest):
     # -------------------------
     # DAILY AGGREGATION
     # -------------------------
-    daily = (
-        df.groupby(["date", "category"])["amount"]
-        .sum()
-        .reset_index()
-    )
+    daily = df.groupby(["date", "category"])["amount"].sum().reset_index()
 
     if len(daily) < 5:
         raise HTTPException(
@@ -79,26 +85,19 @@ def predict(req: PredictRequest):
     # FEATURE ENGINEERING
     # -------------------------
     daily = daily.sort_values(["category_id", "date"])
-
     daily["dow"] = daily["date"].dt.weekday
     daily["is_weekend"] = (daily["dow"] >= 5).astype(int)
     daily["day"] = daily["date"].dt.day
     daily["month"] = daily["date"].dt.month
 
+    # Lag features
     daily["lag_1"] = daily.groupby("category_id")["amount"].shift(1)
-    daily["lag_7"] = (
-        daily.groupby("category_id")["amount"]
-        .rolling(7)
-        .mean()
-        .shift(1)
+    daily["lag_7"] = daily.groupby("category_id")["amount"].apply(
+        lambda x: x.rolling(7, min_periods=1).mean().shift(1)
     )
-    daily["lag_14"] = (
-        daily.groupby("category_id")["amount"]
-        .rolling(14)
-        .mean()
-        .shift(1)
+    daily["lag_14"] = daily.groupby("category_id")["amount"].apply(
+        lambda x: x.rolling(14, min_periods=1).mean().shift(1)
     )
-
     daily.fillna(0, inplace=True)
 
     FEATURES = [
@@ -144,29 +143,20 @@ def predict(req: PredictRequest):
                 "is_weekend": int(next_date.weekday() >= 5),
                 "day": next_date.day,
                 "month": next_date.month,
-                "lag_1": history.iloc[-1]["amount"],
-                "lag_7": history.tail(7)["amount"].mean(),
-                "lag_14": history.tail(14)["amount"].mean(),
+                "lag_1": history.iloc[-1]["amount"] if len(history) >= 1 else 0,
+                "lag_7": history.tail(7)["amount"].mean() if len(history) >= 1 else 0,
+                "lag_14": history.tail(14)["amount"].mean() if len(history) >= 1 else 0,
             }
 
-            pred = max(
-                model.predict(pd.DataFrame([row])[FEATURES])[0],
-                0
-            )
+            pred = max(model.predict(pd.DataFrame([row])[FEATURES])[0], 0)
 
-            history = pd.concat(
-                [
-                    history,
-                    pd.DataFrame(
-                        [{
-                            "date": next_date,
-                            "category_id": cat_id,
-                            "amount": pred
-                        }]
-                    )
-                ],
-                ignore_index=True
-            )
+            # Append new prediction to history
+            new_row = pd.DataFrame([{
+                "date": next_date,
+                "category_id": cat_id,
+                "amount": pred
+            }])
+            history = pd.concat([history, new_row], ignore_index=True)
 
             results.append({
                 "date": str(next_date.date()),
@@ -177,20 +167,12 @@ def predict(req: PredictRequest):
     forecast = pd.DataFrame(results)
 
     # -------------------------
-    # AGGREGATE 7 / 14 / 30
+    # AGGREGATE 7 / 14 / 30 DAYS
     # -------------------------
     output: Dict[str, Dict[str, float]] = {}
 
     for days in [7, 14, 30]:
-        output[f"{days}_days"] = (
-            forecast.groupby("category")["predicted_amount"]
-            .head(days)
-            .groupby(level=0)
-            .sum()
-            .round(2)
-            .to_dict()
-        )
+        temp = forecast.groupby("category").head(days)
+        output[f"{days}_days"] = temp.groupby("category")["predicted_amount"].sum().round(2).to_dict()
 
-    return {
-        "predictions": output
-    }
+    return {"predictions": output}
