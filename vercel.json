@@ -1,6 +1,4 @@
 {
-  "version": 2,
-  "functions": {
-    "api/predict.py": {}
-  }
+  "version": 2
 }
+
