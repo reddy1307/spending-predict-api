@@ -38,10 +38,13 @@ def health():
 # =========================
 @app.post("/predict")
 def predict(req: PredictRequest):
+
     if not req.transactions:
         raise HTTPException(status_code=400, detail="No transactions provided")
 
+    # -------------------------
     # Convert to DataFrame
+    # -------------------------
     df = pd.DataFrame([t.dict() for t in req.transactions])
     df["date"] = pd.to_datetime(df["date"])
 
@@ -51,24 +54,30 @@ def predict(req: PredictRequest):
     if df.empty:
         raise HTTPException(status_code=400, detail="No valid expense data")
 
-    # =========================
+    # -------------------------
     # DAILY AGGREGATION
-    # =========================
+    # -------------------------
     daily = (
         df.groupby(["date", "category"])["amount"]
         .sum()
         .reset_index()
     )
 
-    # =========================
+    if len(daily) < 5:
+        raise HTTPException(
+            status_code=400,
+            detail="Not enough data (minimum 5 days required)"
+        )
+
+    # -------------------------
     # CATEGORY ENCODING
-    # =========================
+    # -------------------------
     le = LabelEncoder()
     daily["category_id"] = le.fit_transform(daily["category"])
 
-    # =========================
+    # -------------------------
     # FEATURE ENGINEERING
-    # =========================
+    # -------------------------
     daily = daily.sort_values(["category_id", "date"])
 
     daily["dow"] = daily["date"].dt.weekday
@@ -77,33 +86,49 @@ def predict(req: PredictRequest):
     daily["month"] = daily["date"].dt.month
 
     daily["lag_1"] = daily.groupby("category_id")["amount"].shift(1)
-    daily["lag_7"] = daily.groupby("category_id")["amount"].rolling(7).mean().shift(1)
-    daily["lag_14"] = daily.groupby("category_id")["amount"].rolling(14).mean().shift(1)
+    daily["lag_7"] = (
+        daily.groupby("category_id")["amount"]
+        .rolling(7)
+        .mean()
+        .shift(1)
+    )
+    daily["lag_14"] = (
+        daily.groupby("category_id")["amount"]
+        .rolling(14)
+        .mean()
+        .shift(1)
+    )
 
     daily.fillna(0, inplace=True)
 
     FEATURES = [
-        "category_id", "dow", "is_weekend",
-        "day", "month", "lag_1", "lag_7", "lag_14"
+        "category_id",
+        "dow",
+        "is_weekend",
+        "day",
+        "month",
+        "lag_1",
+        "lag_7",
+        "lag_14"
     ]
 
-    # =========================
+    # -------------------------
     # TRAIN MODEL
-    # =========================
+    # -------------------------
     X = daily[FEATURES]
     y = daily["amount"]
 
     model = GradientBoostingRegressor(
-        n_estimators=150,     # fast + server-safe
+        n_estimators=150,
         learning_rate=0.05,
         max_depth=4,
         random_state=42
     )
     model.fit(X, y)
 
-    # =========================
+    # -------------------------
     # ROLLING PREDICTION (30 DAYS)
-    # =========================
+    # -------------------------
     last_date = daily["date"].max()
     results = []
 
@@ -130,11 +155,16 @@ def predict(req: PredictRequest):
             )
 
             history = pd.concat(
-                [history, pd.DataFrame([{
-                    "date": next_date,
-                    "category_id": cat_id,
-                    "amount": pred
-                }])],
+                [
+                    history,
+                    pd.DataFrame(
+                        [{
+                            "date": next_date,
+                            "category_id": cat_id,
+                            "amount": pred
+                        }]
+                    )
+                ],
                 ignore_index=True
             )
 
@@ -146,9 +176,9 @@ def predict(req: PredictRequest):
 
     forecast = pd.DataFrame(results)
 
-    # =========================
+    # -------------------------
     # AGGREGATE 7 / 14 / 30
-    # =========================
+    # -------------------------
     output: Dict[str, Dict[str, float]] = {}
 
     for days in [7, 14, 30]:
@@ -164,15 +194,3 @@ def predict(req: PredictRequest):
     return {
         "predictions": output
     }
-
-# =========================
-# RUN WITH UVICORN
-# =========================
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True
-    )
