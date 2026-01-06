@@ -5,6 +5,7 @@ import pandas as pd
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.preprocessing import LabelEncoder
 from datetime import timedelta
+import uvicorn
 
 app = FastAPI(
     title="Spending Prediction API",
@@ -147,3 +148,7 @@ def predict(req: PredictRequest):
         output[f"{days}_days"] = temp.groupby("category")["predicted_amount"].sum().round(2).to_dict()
 
     return {"predictions": output}
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
