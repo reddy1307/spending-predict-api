@@ -6,9 +6,6 @@ from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.preprocessing import LabelEncoder
 from datetime import timedelta
 
-# =========================
-# FASTAPI APP
-# =========================
 app = FastAPI(
     title="Spending Prediction API",
     description="Predict spending for 7, 14, 30 days (category-wise)",
@@ -42,31 +39,22 @@ def predict(req: PredictRequest):
     if not req.transactions:
         raise HTTPException(status_code=400, detail="No transactions provided")
 
-    # -------------------------
-    # Convert to DataFrame
-    # -------------------------
     df = pd.DataFrame([t.dict() for t in req.transactions])
 
-    # Ensure columns exist
     for col in ["date", "amount", "category"]:
         if col not in df.columns:
             df[col] = None
 
-    # Parse dates
     try:
         df["date"] = pd.to_datetime(df["date"])
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid date format: {e}")
 
-    # Only expenses (treat all as positive spending)
     df["amount"] = df["amount"].abs()
 
     if df.empty:
         raise HTTPException(status_code=400, detail="No valid expense data")
 
-    # -------------------------
-    # DAILY AGGREGATION
-    # -------------------------
     daily = df.groupby(["date", "category"])["amount"].sum().reset_index()
 
     if len(daily) < 5:
@@ -75,15 +63,9 @@ def predict(req: PredictRequest):
             detail="Not enough data (minimum 5 days required)"
         )
 
-    # -------------------------
-    # CATEGORY ENCODING
-    # -------------------------
     le = LabelEncoder()
     daily["category_id"] = le.fit_transform(daily["category"])
 
-    # -------------------------
-    # FEATURE ENGINEERING
-    # -------------------------
     daily = daily.sort_values(["category_id", "date"])
     daily["dow"] = daily["date"].dt.weekday
     daily["is_weekend"] = (daily["dow"] >= 5).astype(int)
@@ -111,9 +93,6 @@ def predict(req: PredictRequest):
         "lag_14"
     ]
 
-    # -------------------------
-    # TRAIN MODEL
-    # -------------------------
     X = daily[FEATURES]
     y = daily["amount"]
 
@@ -125,9 +104,6 @@ def predict(req: PredictRequest):
     )
     model.fit(X, y)
 
-    # -------------------------
-    # ROLLING PREDICTION (30 DAYS)
-    # -------------------------
     last_date = daily["date"].max()
     results = []
 
@@ -150,7 +126,6 @@ def predict(req: PredictRequest):
 
             pred = max(model.predict(pd.DataFrame([row])[FEATURES])[0], 0)
 
-            # Append new prediction to history
             new_row = pd.DataFrame([{
                 "date": next_date,
                 "category_id": cat_id,
@@ -166,11 +141,7 @@ def predict(req: PredictRequest):
 
     forecast = pd.DataFrame(results)
 
-    # -------------------------
-    # AGGREGATE 7 / 14 / 30 DAYS
-    # -------------------------
     output: Dict[str, Dict[str, float]] = {}
-
     for days in [7, 14, 30]:
         temp = forecast.groupby("category").head(days)
         output[f"{days}_days"] = temp.groupby("category")["predicted_amount"].sum().round(2).to_dict()
