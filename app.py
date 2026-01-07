@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import List, Dict
+from typing import List, Dict, Any
 import pandas as pd
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.preprocessing import LabelEncoder
@@ -22,6 +22,7 @@ class Transaction(BaseModel):
 
 class PredictRequest(BaseModel):
     transactions: List[Transaction]
+    days: int  # Add this since frontend sends it
 
 # =========================
 # HEALTH CHECK
@@ -77,7 +78,7 @@ def predict(req: PredictRequest):
     daily["month"] = daily["date"].dt.month
 
     # =========================
-    # LAG FEATURES (FIXED)
+    # LAG FEATURES
     # =========================
     daily["lag_1"] = daily.groupby("category_id")["amount"].shift(1)
 
@@ -158,14 +159,28 @@ def predict(req: PredictRequest):
 
     forecast = pd.DataFrame(results)
 
-    output: Dict[str, Dict[str, float]] = {}
-    for days in [7, 14, 30]:
-        temp = forecast.groupby("category").head(days)
-        output[f"{days}_days"] = (
-            temp.groupby("category")["predicted_amount"]
-            .sum()
-            .round(2)
-            .to_dict()
-        )
-
-    return {"predictions": output}
+    # Build predictions for the requested days
+    requested_days = req.days  # Use the days from frontend request
+    
+    # Filter forecast for the requested days
+    predictions_for_days = forecast.groupby("category").head(requested_days)
+    
+    # Calculate total per category for requested days
+    category_totals = predictions_for_days.groupby("category")["predicted_amount"].sum().round(2).to_dict()
+    
+    # Format predictions as array of objects (matching frontend expectations)
+    predictions_array = []
+    for category, amount in category_totals.items():
+        predictions_array.append({
+            "category": category,
+            "amount": float(amount),  # Convert numpy.float64 to Python float
+            "days": requested_days,  # Include days in response
+            "isDemo": False  # Add this flag for frontend compatibility
+        })
+    
+    # Return the exact format frontend expects
+    return {
+        "predictions": predictions_array,
+        "success": True,
+        "days": requested_days
+    }
