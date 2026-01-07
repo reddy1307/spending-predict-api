@@ -5,7 +5,6 @@ import pandas as pd
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.preprocessing import LabelEncoder
 from datetime import timedelta
-import uvicorn
 
 app = FastAPI(
     title="Spending Prediction API",
@@ -17,7 +16,7 @@ app = FastAPI(
 # REQUEST MODELS
 # =========================
 class Transaction(BaseModel):
-    date: str          # "YYYY-MM-DD"
+    date: str          # YYYY-MM-DD
     amount: float
     category: str
 
@@ -42,45 +41,54 @@ def predict(req: PredictRequest):
 
     df = pd.DataFrame([t.dict() for t in req.transactions])
 
-    for col in ["date", "amount", "category"]:
-        if col not in df.columns:
-            df[col] = None
-
     try:
         df["date"] = pd.to_datetime(df["date"])
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid date format: {e}")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid date format")
 
     df["amount"] = df["amount"].abs()
 
     if df.empty:
-        raise HTTPException(status_code=400, detail="No valid expense data")
+        raise HTTPException(status_code=400, detail="No valid data")
 
-    daily = df.groupby(["date", "category"])["amount"].sum().reset_index()
+    # Daily totals
+    daily = (
+        df.groupby(["date", "category"], as_index=False)["amount"]
+        .sum()
+        .sort_values("date")
+    )
 
-    if len(daily) < 5:
+    if daily["date"].nunique() < 5:
         raise HTTPException(
             status_code=400,
             detail="Not enough data (minimum 5 days required)"
         )
 
+    # Encode categories
     le = LabelEncoder()
     daily["category_id"] = le.fit_transform(daily["category"])
 
     daily = daily.sort_values(["category_id", "date"])
+
+    # Date features
     daily["dow"] = daily["date"].dt.weekday
     daily["is_weekend"] = (daily["dow"] >= 5).astype(int)
     daily["day"] = daily["date"].dt.day
     daily["month"] = daily["date"].dt.month
 
-    # Lag features
+    # =========================
+    # LAG FEATURES (FIXED)
+    # =========================
     daily["lag_1"] = daily.groupby("category_id")["amount"].shift(1)
-    daily["lag_7"] = daily.groupby("category_id")["amount"].apply(
+
+    daily["lag_7"] = daily.groupby("category_id")["amount"].transform(
         lambda x: x.rolling(7, min_periods=1).mean().shift(1)
     )
-    daily["lag_14"] = daily.groupby("category_id")["amount"].apply(
+
+    daily["lag_14"] = daily.groupby("category_id")["amount"].transform(
         lambda x: x.rolling(14, min_periods=1).mean().shift(1)
     )
+
     daily.fillna(0, inplace=True)
 
     FEATURES = [
@@ -97,6 +105,7 @@ def predict(req: PredictRequest):
     X = daily[FEATURES]
     y = daily["amount"]
 
+    # Train model
     model = GradientBoostingRegressor(
         n_estimators=150,
         learning_rate=0.05,
@@ -105,6 +114,9 @@ def predict(req: PredictRequest):
     )
     model.fit(X, y)
 
+    # =========================
+    # FUTURE PREDICTION
+    # =========================
     last_date = daily["date"].max()
     results = []
 
@@ -114,25 +126,29 @@ def predict(req: PredictRequest):
         for i in range(30):
             next_date = last_date + timedelta(days=i + 1)
 
+            last_amt = history["amount"].iloc[-1] if not history.empty else 0
+
             row = {
                 "category_id": cat_id,
                 "dow": next_date.weekday(),
                 "is_weekend": int(next_date.weekday() >= 5),
                 "day": next_date.day,
                 "month": next_date.month,
-                "lag_1": history.iloc[-1]["amount"] if len(history) >= 1 else 0,
-                "lag_7": history.tail(7)["amount"].mean() if len(history) >= 1 else 0,
-                "lag_14": history.tail(14)["amount"].mean() if len(history) >= 1 else 0,
+                "lag_1": last_amt,
+                "lag_7": history.tail(7)["amount"].mean() if not history.empty else 0,
+                "lag_14": history.tail(14)["amount"].mean() if not history.empty else 0,
             }
 
             pred = max(model.predict(pd.DataFrame([row])[FEATURES])[0], 0)
 
-            new_row = pd.DataFrame([{
-                "date": next_date,
-                "category_id": cat_id,
-                "amount": pred
-            }])
-            history = pd.concat([history, new_row], ignore_index=True)
+            history = pd.concat(
+                [history, pd.DataFrame([{
+                    "date": next_date,
+                    "category_id": cat_id,
+                    "amount": pred
+                }])],
+                ignore_index=True
+            )
 
             results.append({
                 "date": str(next_date.date()),
@@ -145,10 +161,11 @@ def predict(req: PredictRequest):
     output: Dict[str, Dict[str, float]] = {}
     for days in [7, 14, 30]:
         temp = forecast.groupby("category").head(days)
-        output[f"{days}_days"] = temp.groupby("category")["predicted_amount"].sum().round(2).to_dict()
+        output[f"{days}_days"] = (
+            temp.groupby("category")["predicted_amount"]
+            .sum()
+            .round(2)
+            .to_dict()
+        )
 
     return {"predictions": output}
-
-
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
