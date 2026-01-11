@@ -87,9 +87,10 @@ def predict(req: PredictRequest):
             cat_data = daily[daily["category_id"] == cat_id]["amount"]
             category_stats[cat_id] = {
                 'mean': float(cat_data.mean()),
-                'std': float(cat_data.std()),
+                'std': float(cat_data.std()) if len(cat_data) > 1 else 0,
                 'median': float(cat_data.median()),
-                'max': float(cat_data.max())
+                'max': float(cat_data.max()),
+                'min': float(cat_data.min())
             }
 
         # -------------------------
@@ -101,7 +102,7 @@ def predict(req: PredictRequest):
         daily["day"] = daily["date"].dt.day
         daily["month"] = daily["date"].dt.month
 
-        # LAG FEATURES using shift and rolling
+        # LAG FEATURES - using pandas shift and rolling
         daily["lag_1"] = daily.groupby("category_id")["amount"].shift(1)
         
         daily["lag_7"] = daily.groupby("category_id")["amount"].transform(
@@ -151,59 +152,75 @@ def predict(req: PredictRequest):
         model.fit(X, y)
 
         # -------------------------
-        # PREDICTION WITH BETTER STABILITY
+        # PREDICTION (FIXED - No Feedback Loop)
         # -------------------------
         last_date = daily["date"].max()
         results = []
 
         for cat_id in daily["category_id"].unique():
-            # Get historical data for this category
-            cat_history = daily[daily["category_id"] == cat_id].copy()
+            # Get ONLY historical data (no predictions)
+            historical_data = daily[daily["category_id"] == cat_id].copy()
             stats = category_stats[cat_id]
             
-            # Use historical mean as baseline - this prevents explosion
-            baseline_daily = stats['mean']
-            max_prediction = stats['mean'] + 1.5 * stats['std']
+            # Calculate stable baseline from historical data
+            baseline_mean = stats['mean']
+            baseline_std = stats['std']
             
-            # If std is very small or NaN, cap at 1.5x mean
-            if pd.isna(max_prediction) or max_prediction < baseline_daily:
-                max_prediction = baseline_daily * 1.5
+            # AGGRESSIVE CAPS: Set very tight bounds
+            # Max prediction is the SMALLER of:
+            # 1. mean + 1.0*std (reduced from 1.5)
+            # 2. mean * 1.3 (only 30% above average)
+            # 3. historical max (never exceed what actually happened)
+            max_prediction = min(
+                baseline_mean + 1.0 * baseline_std,
+                baseline_mean * 1.3,
+                stats['max']
+            )
+            
+            # If std is 0 or calculation failed, use mean * 1.2
+            if pd.isna(max_prediction) or max_prediction < baseline_mean:
+                max_prediction = baseline_mean * 1.2
 
-            # For predictions, use ONLY historical values for lag features
-            # This prevents the feedback loop that causes explosion
+            # Get historical amounts for lag calculations
+            historical_amounts = historical_data["amount"].values
+
             for i in range(req.days):
                 next_date = last_date + timedelta(days=i + 1)
 
-                # CRITICAL: Use only actual historical data for lags, not predictions
-                historical_amounts = cat_history["amount"].values
-                
+                # CRITICAL FIX: Use ONLY historical data for lags
+                # DO NOT use predicted values in lag features
                 row = {
                     "category_id": cat_id,
                     "dow": next_date.weekday(),
                     "is_weekend": int(next_date.weekday() >= 5),
                     "day": next_date.day,
                     "month": next_date.month,
-                    # Use historical averages, not predicted values
-                    "lag_1": baseline_daily,  # Use mean instead of last prediction
-                    "lag_7": historical_amounts[-7:].mean() if len(historical_amounts) >= 7 else baseline_daily,
-                    "lag_14": historical_amounts[-14:].mean() if len(historical_amounts) >= 14 else baseline_daily,
+                    # Use historical mean instead of last value to prevent feedback
+                    "lag_1": baseline_mean,
+                    "lag_7": historical_amounts[-7:].mean() if len(historical_amounts) >= 7 else baseline_mean,
+                    "lag_14": historical_amounts[-14:].mean() if len(historical_amounts) >= 14 else baseline_mean,
                 }
 
                 # Predict
                 pred = model.predict(pd.DataFrame([row])[FEATURES])[0]
                 
-                # Apply multiple safety caps
-                pred = max(0, pred)  # No negative
-                pred = min(pred, max_prediction)  # Cap at mean + 1.5*std
-                pred = min(pred, stats['max'] * 1.2)  # Never exceed 120% of historical max
+                # MULTIPLE AGGRESSIVE SAFETY CAPS
+                pred = max(0, pred)  # No negative values
+                pred = min(pred, max_prediction)  # Cap at our calculated max
+                pred = min(pred, stats['max'])  # NEVER exceed historical max
+                pred = min(pred, baseline_mean * 1.5)  # NEVER more than 1.5x average
                 
-                # Blend with historical mean (80% prediction, 20% historical mean)
-                # This stabilizes predictions
-                pred = 0.8 * pred + 0.2 * baseline_daily
+                # STRONG regression to mean: 50-50 blend
+                # This anchors predictions very close to historical average
+                pred = 0.5 * pred + 0.5 * baseline_mean
                 
-                # Apply decay for far future predictions
+                # Moderate decay for stability
                 decay = 0.99 ** i
                 pred = pred * decay
+                
+                # FINAL SAFETY CHECK: If somehow still too high, cap it
+                if pred > baseline_mean * 2:
+                    pred = baseline_mean * 1.2
 
                 results.append({
                     "date": str(next_date.date()),
